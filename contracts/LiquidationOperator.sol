@@ -140,9 +140,11 @@ contract LiquidationOperator is IUniswapV2Callee {
     address constant WETH_ADDR = 0xC02aaA39b223FE8D0A0e5C4F27eAD9083C756Cc2;
     address constant AAVE_LENDING_POOL = 0x7d2768dE32b0b80b7a3454c06BdAc94A69DDc7A9;
     address constant UNISWAP_FACTORY = 0x5C69bEe701ef814a2B6a3EDD4B1652CB9cc5aA6f;
+    address constant SUSHISWAP_FACTORY = 0xC0AEe478e3658e2610c5F7A4A2E1777cE9e4f2Ac;
     address constant TARGET_USER = 0x59CE4a2AC5bC3f5F225439B2993b86B42f6d3e9F;
     IUniswapV2Pair immutable wethUsdtPair;
     IUniswapV2Pair immutable wbtcWethPair;
+    IUniswapV2Pair immutable sushiWbtcWethPair;
 
     // some helper function, it is totally fine if you can finish the lab without using these function
     // https://github.com/Uniswap/v2-periphery/blob/master/contracts/libraries/UniswapV2Library.sol
@@ -185,6 +187,7 @@ contract LiquidationOperator is IUniswapV2Callee {
     constructor() {
         wethUsdtPair = IUniswapV2Pair(IUniswapV2Factory(UNISWAP_FACTORY).getPair(WETH_ADDR, USDT));
         wbtcWethPair = IUniswapV2Pair(IUniswapV2Factory(UNISWAP_FACTORY).getPair(WBTC, WETH_ADDR));
+        sushiWbtcWethPair = IUniswapV2Pair(IUniswapV2Factory(SUSHISWAP_FACTORY).getPair(WBTC, WETH_ADDR));
     }
 
     receive() external payable {}
@@ -221,13 +224,26 @@ contract LiquidationOperator is IUniswapV2Callee {
         IERC20(USDT).approve(AAVE_LENDING_POOL, amount1);
         ILendingPool(AAVE_LENDING_POOL).liquidationCall(WBTC, USDT, TARGET_USER, amount1, false);
 
-        // 2.2 swap WBTC → WETH via WBTC/WETH pair
+        // 2.2 swap WBTC → WETH split across Uniswap + SushiSwap to reduce price impact
         uint256 wbtcBalance = IERC20(WBTC).balanceOf(address(this));
-        // WBTC/WETH pair: token0=WBTC, token1=WETH
-        (uint112 reserveWBTC, uint112 reserveWETH,) = wbtcWethPair.getReserves();
-        uint256 wethOut = getAmountOut(wbtcBalance, reserveWBTC, reserveWETH);
-        IERC20(WBTC).transfer(address(wbtcWethPair), wbtcBalance);
-        wbtcWethPair.swap(0, wethOut, address(this), "");
+
+        // Get reserves from both pools (token0=WBTC, token1=WETH in both)
+        (uint112 uniReserveWBTC, uint112 uniReserveWETH,) = wbtcWethPair.getReserves();
+        (uint112 sushiReserveWBTC, uint112 sushiReserveWETH,) = sushiWbtcWethPair.getReserves();
+
+        // Split proportional to input reserves (optimal for equal-fee constant-product AMMs)
+        uint256 uniAmount = wbtcBalance * uint256(uniReserveWBTC) / (uint256(uniReserveWBTC) + uint256(sushiReserveWBTC));
+        uint256 sushiAmount = wbtcBalance - uniAmount;
+
+        // Swap through Uniswap
+        uint256 uniWethOut = getAmountOut(uniAmount, uniReserveWBTC, uniReserveWETH);
+        IERC20(WBTC).transfer(address(wbtcWethPair), uniAmount);
+        wbtcWethPair.swap(0, uniWethOut, address(this), "");
+
+        // Swap through SushiSwap
+        uint256 sushiWethOut = getAmountOut(sushiAmount, sushiReserveWBTC, sushiReserveWETH);
+        IERC20(WBTC).transfer(address(sushiWbtcWethPair), sushiAmount);
+        sushiWbtcWethPair.swap(0, sushiWethOut, address(this), "");
 
         // 2.3 repay flash loan in WETH
         // WETH/USDT pair: token0=WETH, token1=USDT
