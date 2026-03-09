@@ -137,9 +137,37 @@ interface ICurvePool {
     ) external;
 }
 
+interface ISwapRouter {
+    struct ExactInputSingleParams {
+        address tokenIn;
+        address tokenOut;
+        uint24 fee;
+        address recipient;
+        uint256 deadline;
+        uint256 amountIn;
+        uint256 amountOutMinimum;
+        uint160 sqrtPriceLimitX96;
+    }
+
+    function exactInputSingle(ExactInputSingleParams calldata params)
+        external
+        payable
+        returns (uint256 amountOut);
+}
+
+interface IQuoter {
+    function quoteExactInputSingle(
+        address tokenIn,
+        address tokenOut,
+        uint24 fee,
+        uint256 amountIn,
+        uint160 sqrtPriceLimitX96
+    ) external returns (uint256 amountOut);
+}
+
 // ----------------------IMPLEMENTATION------------------------------
 
-contract LiquidationOperator is IUniswapV2Callee {
+contract BaseLiquidationOperator is IUniswapV2Callee {
     uint8 public constant health_factor_decimals = 18;
 
     address constant USDT = 0xdAC17F958D2ee523a2206206994597C13D831ec7;
@@ -150,17 +178,24 @@ contract LiquidationOperator is IUniswapV2Callee {
     address constant CURVE_3POOL = 0xbEbc44782C7dB0a1A60Cb6fe97d0b483032FF1C7;
     address constant UNISWAP_FACTORY = 0x5C69bEe701ef814a2B6a3EDD4B1652CB9cc5aA6f;
     address constant SUSHISWAP_FACTORY = 0xC0AEe478e3658e2610c5F7A4A2E1777cE9e4f2Ac;
+    address constant UNISWAP_V3_ROUTER = 0xE592427A0AEce92De3Edee1F18E0157C05861564;
+    address constant UNISWAP_V3_QUOTER = 0xb27308f9F90D607463bb33eA1BeBb41C27CE5AB6;
     address constant TARGET_USER = 0x59CE4a2AC5bC3f5F225439B2993b86B42f6d3e9F;
     uint256 constant FIRST_LIQUIDATION_USDT = 2916378221684;
-    uint256 constant FLASH_BORROW_BPS = 15000;
-    uint256 constant FLASH_BORROW_USDT = (FIRST_LIQUIDATION_USDT * FLASH_BORROW_BPS) / 10000;
-    uint256 constant DIRECT_WBTC_USDT_WEIGHT_BPS = 20000;
-    uint256 constant USDT_CONVERSION_TARGET_BPS = 7500;
+    uint256 constant V3_DIRECT_USDC_TARGET_BPS = 1800;
+    uint24 constant V3_FEE = 3000;
+
+    uint256 flashBorrowUsdt;
+    uint256 maxLiquidationSteps;
+    uint256 directWbtcUsdtWeightBps;
+    uint256 usdtConversionTargetBps;
+    uint256 usdtRepaymentBps;
 
     IUniswapV2Pair immutable wethUsdtPair;
+    IUniswapV2Pair immutable sushiWethUsdtPair;
     IUniswapV2Pair immutable wbtcWethPair;
     IUniswapV2Pair immutable sushiWbtcWethPair;
-    IUniswapV2Pair immutable uniWbtcUsdtPair;
+    IUniswapV2Pair immutable uniWbtcUsdcPair;
     IUniswapV2Pair immutable uniUsdcWethPair;
     IUniswapV2Pair immutable sushiUsdcWethPair;
 
@@ -338,8 +373,47 @@ contract LiquidationOperator is IUniswapV2Callee {
         );
     }
 
+    function findMinimumUsdtRepayment(
+        uint256 reserveWeth,
+        uint256 reserveUsdt,
+        uint256 borrowedUsdt,
+        uint256 maxUsdtRepayment,
+        uint256 availableWeth
+    ) internal pure returns (uint256 usdtNeeded) {
+        require(
+            getMinimumWethRepayment(
+                reserveWeth,
+                reserveUsdt,
+                borrowedUsdt,
+                maxUsdtRepayment
+            ) <= availableWeth,
+            "Insufficient repayment assets"
+        );
+
+        uint256 low = 0;
+        uint256 high = maxUsdtRepayment;
+        while (low < high) {
+            uint256 mid = (low + high) / 2;
+            if (
+                getMinimumWethRepayment(
+                    reserveWeth,
+                    reserveUsdt,
+                    borrowedUsdt,
+                    mid
+                ) <= availableWeth
+            ) {
+                high = mid;
+            } else {
+                low = mid + 1;
+            }
+        }
+
+        return low;
+    }
+
     constructor() {
         address wethUsdt = IUniswapV2Factory(UNISWAP_FACTORY).getPair(WETH_ADDR, USDT);
+        address sushiWethUsdt = IUniswapV2Factory(SUSHISWAP_FACTORY).getPair(WETH_ADDR, USDT);
         address uniWbtcWeth = IUniswapV2Factory(UNISWAP_FACTORY).getPair(WBTC, WETH_ADDR);
         address sushiWbtcWeth = IUniswapV2Factory(SUSHISWAP_FACTORY).getPair(WBTC, WETH_ADDR);
         address uniWbtcUsdt = IUniswapV2Factory(UNISWAP_FACTORY).getPair(WBTC, USDT);
@@ -347,6 +421,7 @@ contract LiquidationOperator is IUniswapV2Callee {
         address sushiUsdcWeth = IUniswapV2Factory(SUSHISWAP_FACTORY).getPair(USDC, WETH_ADDR);
 
         require(wethUsdt != address(0), "Missing WETH/USDT");
+        require(sushiWethUsdt != address(0), "Missing Sushi WETH/USDT");
         require(uniWbtcWeth != address(0), "Missing Uni WBTC/WETH");
         require(sushiWbtcWeth != address(0), "Missing Sushi WBTC/WETH");
         require(uniWbtcUsdt != address(0), "Missing WBTC/USDT");
@@ -354,109 +429,240 @@ contract LiquidationOperator is IUniswapV2Callee {
         require(sushiUsdcWeth != address(0), "Missing Sushi USDC/WETH");
 
         wethUsdtPair = IUniswapV2Pair(wethUsdt);
+        sushiWethUsdtPair = IUniswapV2Pair(sushiWethUsdt);
         wbtcWethPair = IUniswapV2Pair(uniWbtcWeth);
         sushiWbtcWethPair = IUniswapV2Pair(sushiWbtcWeth);
-        uniWbtcUsdtPair = IUniswapV2Pair(uniWbtcUsdt);
+        uniWbtcUsdcPair = IUniswapV2Pair(uniWbtcUsdt);
         uniUsdcWethPair = IUniswapV2Pair(uniUsdcWeth);
         sushiUsdcWethPair = IUniswapV2Pair(sushiUsdcWeth);
     }
 
-    receive() external payable {}
-
-    // required by the testing script, entry for your liquidation call
-    function operate() external {
-        // 1. get the target user account data & make sure it is liquidatable
-        (,,,,,uint256 healthFactor) = ILendingPool(AAVE_LENDING_POOL).getUserAccountData(TARGET_USER);
-        require(healthFactor < 1e18, "Target user is not liquidatable");
-
-        // 2. call flash swap to liquidate the target user
-        // token0=WETH, token1=USDT; borrow USDT so amount0Out=0, amount1Out=amount
-        wethUsdtPair.swap(0, FLASH_BORROW_USDT, address(this), "flash");
-
-        // 3. Convert the profit into ETH and send back to sender
-        uint256 wethBalance = IERC20(WETH_ADDR).balanceOf(address(this));
-        IWETH(WETH_ADDR).withdraw(wethBalance);
-        payable(msg.sender).transfer(address(this).balance);
+    function _setStrategy(
+        uint256 flashBorrowBps,
+        uint256 liquidationSteps,
+        uint256 directWbtcUsdtWeight,
+        uint256 usdtConversionTarget,
+        uint256 usdtRepayment
+    ) internal {
+        flashBorrowUsdt = (FIRST_LIQUIDATION_USDT * flashBorrowBps) / 10000;
+        maxLiquidationSteps = liquidationSteps;
+        directWbtcUsdtWeightBps = directWbtcUsdtWeight;
+        usdtConversionTargetBps = usdtConversionTarget;
+        usdtRepaymentBps = usdtRepayment;
     }
 
-    // required by the swap
-    function uniswapV2Call(
-        address sender,
-        uint256,
-        uint256 amount1,
-        bytes calldata
-    ) external override {
-        // 2.0. security checks
-        require(msg.sender == address(wethUsdtPair), "Unauthorized");
-        require(sender == address(this), "Invalid sender");
+    function swapV3ExactInputSingle(
+        address tokenIn,
+        address tokenOut,
+        uint256 amountIn
+    ) internal returns (uint256 amountOut) {
+        if (amountIn == 0) {
+            return 0;
+        }
 
+        IERC20(tokenIn).approve(UNISWAP_V3_ROUTER, 0);
+        IERC20(tokenIn).approve(UNISWAP_V3_ROUTER, amountIn);
+        amountOut = ISwapRouter(UNISWAP_V3_ROUTER).exactInputSingle(
+            ISwapRouter.ExactInputSingleParams({
+                tokenIn: tokenIn,
+                tokenOut: tokenOut,
+                fee: V3_FEE,
+                recipient: address(this),
+                deadline: block.timestamp,
+                amountIn: amountIn,
+                amountOutMinimum: 0,
+                sqrtPriceLimitX96: 0
+            })
+        );
+    }
+
+    function quoteV3ExactInputSingle(
+        address tokenIn,
+        address tokenOut,
+        uint256 amountIn
+    ) internal returns (uint256 amountOut) {
+        if (amountIn == 0) {
+            return 0;
+        }
+
+        amountOut = IQuoter(UNISWAP_V3_QUOTER).quoteExactInputSingle(
+            tokenIn,
+            tokenOut,
+            V3_FEE,
+            amountIn,
+            0
+        );
+    }
+
+    function findWethInForTargetUsdcV3(
+        uint256 targetUsdcOut,
+        uint256 maxWethIn
+    ) internal returns (uint256 wethIn) {
+        if (targetUsdcOut == 0) {
+            return 0;
+        }
+
+        if (quoteV3ExactInputSingle(WETH_ADDR, USDC, maxWethIn) <= targetUsdcOut) {
+            return maxWethIn;
+        }
+
+        uint256 low = 0;
+        uint256 high = maxWethIn;
+        while (low < high) {
+            uint256 mid = (low + high) / 2;
+            if (quoteV3ExactInputSingle(WETH_ADDR, USDC, mid) >= targetUsdcOut) {
+                high = mid;
+            } else {
+                low = mid + 1;
+            }
+        }
+
+        return low;
+    }
+
+    function findWbtcInForTargetUsdcV3(
+        uint256 targetUsdcOut,
+        uint256 maxWbtcIn
+    ) internal returns (uint256 wbtcIn) {
+        if (targetUsdcOut == 0) {
+            return 0;
+        }
+
+        if (quoteV3ExactInputSingle(WBTC, USDC, maxWbtcIn) <= targetUsdcOut) {
+            return maxWbtcIn;
+        }
+
+        uint256 low = 0;
+        uint256 high = maxWbtcIn;
+        while (low < high) {
+            uint256 mid = (low + high) / 2;
+            if (quoteV3ExactInputSingle(WBTC, USDC, mid) >= targetUsdcOut) {
+                high = mid;
+            } else {
+                low = mid + 1;
+            }
+        }
+
+        return low;
+    }
+
+    function cleanupUsdcToWeth() internal {
+        uint256 usdcBalance = IERC20(USDC).balanceOf(address(this));
+        if (usdcBalance == 0) {
+            return;
+        }
+
+        (uint112 uniReserveUsdc, uint112 uniReserveWeth,) = uniUsdcWethPair.getReserves();
+        (uint112 sushiReserveUsdc, uint112 sushiReserveWeth,) = sushiUsdcWethPair.getReserves();
+        uint256 totalReserveUsdc = uint256(uniReserveUsdc) + uint256(sushiReserveUsdc);
+        require(totalReserveUsdc > 0, "Missing cleanup liquidity");
+
+        uint256 uniUsdcIn = (usdcBalance * uint256(uniReserveUsdc)) / totalReserveUsdc;
+        uint256 sushiUsdcIn = usdcBalance - uniUsdcIn;
+
+        swapToken0ForToken1(
+            uniUsdcWethPair,
+            USDC,
+            uniUsdcIn,
+            uint256(uniReserveUsdc),
+            uint256(uniReserveWeth)
+        );
+        swapToken0ForToken1(
+            sushiUsdcWethPair,
+            USDC,
+            sushiUsdcIn,
+            uint256(sushiReserveUsdc),
+            uint256(sushiReserveWeth)
+        );
+    }
+
+    function cleanupUsdtToWeth() internal {
+        uint256 usdtBalance = IERC20(USDT).balanceOf(address(this));
+        if (usdtBalance == 0) {
+            return;
+        }
+
+        (uint112 uniReserveWeth, uint112 uniReserveUsdt,) = wethUsdtPair.getReserves();
+        (uint112 sushiReserveWeth, uint112 sushiReserveUsdt,) = sushiWethUsdtPair.getReserves();
+        uint256 totalReserveUsdt = uint256(uniReserveUsdt) + uint256(sushiReserveUsdt);
+        require(totalReserveUsdt > 0, "Missing USDT cleanup liquidity");
+
+        uint256 uniUsdtIn = (usdtBalance * uint256(uniReserveUsdt)) / totalReserveUsdt;
+        uint256 sushiUsdtIn = usdtBalance - uniUsdtIn;
+
+        swapToken1ForToken0(
+            wethUsdtPair,
+            USDT,
+            uniUsdtIn,
+            uint256(uniReserveUsdt),
+            uint256(uniReserveWeth)
+        );
+        swapToken1ForToken0(
+            sushiWethUsdtPair,
+            USDT,
+            sushiUsdtIn,
+            uint256(sushiReserveUsdt),
+            uint256(sushiReserveWeth)
+        );
+    }
+
+    function executeLiquidationAndSwaps(uint256 totalBorrowedUsdt) internal {
         IERC20(USDT).approve(AAVE_LENDING_POOL, 0);
         IERC20(USDT).approve(AAVE_LENDING_POOL, type(uint256).max);
 
         ILendingPool lendingPool = ILendingPool(AAVE_LENDING_POOL);
 
-        // 2.1 first liquidation, capped by Aave at 50% of the current debt
-        lendingPool.liquidationCall(WBTC, USDT, TARGET_USER, type(uint256).max, false);
+        // Aave V2 caps each liquidation step. Keep liquidating while the position
+        // remains under water and the contract still holds repayable USDT.
+        for (uint256 i = 0; i < maxLiquidationSteps; i++) {
+            (,,,,,uint256 healthFactorCurrent) = lendingPool.getUserAccountData(TARGET_USER);
+            if (healthFactorCurrent >= 1e18) {
+                break;
+            }
 
-        // 2.2 second liquidation if the account is still underwater
-        uint256 remainingUsdt = IERC20(USDT).balanceOf(address(this));
-        if (remainingUsdt > 0) {
-            (,,,,,uint256 healthFactorAfterFirst) = lendingPool.getUserAccountData(TARGET_USER);
-            if (healthFactorAfterFirst < 1e18) {
-                try lendingPool.liquidationCall(WBTC, USDT, TARGET_USER, remainingUsdt, false) {} catch {}
+            uint256 usdtBalance = IERC20(USDT).balanceOf(address(this));
+            if (usdtBalance == 0) {
+                break;
+            }
+
+            uint256 usdtBefore = usdtBalance;
+            lendingPool.liquidationCall(WBTC, USDT, TARGET_USER, usdtBalance, false);
+            uint256 usdtAfter = IERC20(USDT).balanceOf(address(this));
+            if (usdtAfter >= usdtBefore) {
+                break;
             }
         }
 
-        // 2.3 sell WBTC across direct USDT and two WETH routes
+        // Split the liquidated WBTC across direct USDC and WETH routes on Uniswap V3.
         {
             uint256 wbtcBalance = IERC20(WBTC).balanceOf(address(this));
-            (uint112 uniReserveWbtc, uint112 uniReserveWeth,) = wbtcWethPair.getReserves();
-            (uint112 sushiReserveWbtc, uint112 sushiReserveWeth,) = sushiWbtcWethPair.getReserves();
-            (uint112 directReserveWbtc, uint112 directReserveUsdt,) = uniWbtcUsdtPair.getReserves();
-            uint256 weightedDirectReserveWbtc =
-                (uint256(directReserveWbtc) * DIRECT_WBTC_USDT_WEIGHT_BPS) / 10000;
-
-            uint256 totalWbtcLiquidity =
-                uint256(uniReserveWbtc) +
-                uint256(sushiReserveWbtc) +
-                weightedDirectReserveWbtc;
-            require(totalWbtcLiquidity > 0, "Missing WBTC liquidity");
-
-            uint256 uniWbtcIn = (wbtcBalance * uint256(uniReserveWbtc)) / totalWbtcLiquidity;
-            uint256 sushiWbtcIn = (wbtcBalance * uint256(sushiReserveWbtc)) / totalWbtcLiquidity;
-            uint256 directWbtcIn = wbtcBalance - uniWbtcIn - sushiWbtcIn;
-
-            swapToken0ForToken1(
-                uniWbtcUsdtPair,
-                WBTC,
-                directWbtcIn,
-                uint256(directReserveWbtc),
-                uint256(directReserveUsdt)
+            uint256 targetDirectUsdcOut =
+                ((totalBorrowedUsdt * V3_DIRECT_USDC_TARGET_BPS) / 10000);
+            uint256 wbtcToUsdc = findWbtcInForTargetUsdcV3(
+                targetDirectUsdcOut,
+                wbtcBalance
             );
-            swapToken0ForToken1(
-                wbtcWethPair,
-                WBTC,
-                uniWbtcIn,
-                uint256(uniReserveWbtc),
-                uint256(uniReserveWeth)
-            );
-            swapToken0ForToken1(
-                sushiWbtcWethPair,
-                WBTC,
-                sushiWbtcIn,
-                uint256(sushiReserveWbtc),
-                uint256(sushiReserveWeth)
-            );
+            uint256 wbtcToWeth = wbtcBalance - wbtcToUsdc;
+
+            swapV3ExactInputSingle(WBTC, USDC, wbtcToUsdc);
+            swapV3ExactInputSingle(WBTC, WETH_ADDR, wbtcToWeth);
+
+            uint256 usdcBalance = IERC20(USDC).balanceOf(address(this));
+            if (usdcBalance > 0) {
+                IERC20(USDC).approve(CURVE_3POOL, 0);
+                IERC20(USDC).approve(CURVE_3POOL, usdcBalance);
+                ICurvePool(CURVE_3POOL).exchange(1, 2, usdcBalance, 0);
+            }
         }
 
-        // 2.4 convert enough WETH to USDC, then 2.5 use Curve 3pool to turn it into USDT
+        // Convert any residual shortfall through WETH -> USDC -> USDT.
         {
             uint256 usdtBalance = IERC20(USDT).balanceOf(address(this));
             uint256 wethBalance = IERC20(WETH_ADDR).balanceOf(address(this));
-            if (usdtBalance < amount1 && wethBalance > 0) {
-                uint256 usdtShortfall = amount1 - usdtBalance;
+            if (usdtBalance < totalBorrowedUsdt && wethBalance > 0) {
+                uint256 usdtShortfall = totalBorrowedUsdt - usdtBalance;
                 uint256 targetUsdcOut =
-                    ((usdtShortfall * USDT_CONVERSION_TARGET_BPS) / 10000) + 1;
+                    ((usdtShortfall * usdtConversionTargetBps) / 10000) + 1;
 
                 (uint112 uniReserveUsdc, uint112 uniReserveWeth,) = uniUsdcWethPair.getReserves();
                 (uint112 sushiReserveUsdc, uint112 sushiReserveWeth,) = sushiUsdcWethPair.getReserves();
@@ -500,22 +706,119 @@ contract LiquidationOperator is IUniswapV2Callee {
                 }
             }
         }
+    }
 
-        // 2.6 mixed repayment: return all USDT first, then top up with the minimum WETH
-        (uint112 reserveWeth, uint112 reserveUsdt,) = wethUsdtPair.getReserves();
-        uint256 usdtRepayment = IERC20(USDT).balanceOf(address(this));
+    function repayFlashPair(IUniswapV2Pair pair, uint256 borrowedUsdt) internal {
+        (uint112 reserveWeth, uint112 reserveUsdt,) = pair.getReserves();
+        uint256 usdtBalanceForRepayment = IERC20(USDT).balanceOf(address(this));
+        uint256 wethBalanceForRepayment = IERC20(WETH_ADDR).balanceOf(address(this));
+        uint256 minimumUsdtRepayment = findMinimumUsdtRepayment(
+            uint256(reserveWeth),
+            uint256(reserveUsdt),
+            borrowedUsdt,
+            usdtBalanceForRepayment,
+            wethBalanceForRepayment
+        );
+        uint256 preferredUsdtRepayment =
+            (usdtBalanceForRepayment * usdtRepaymentBps) / 10000;
+        uint256 usdtRepayment = preferredUsdtRepayment;
+        if (usdtRepayment < minimumUsdtRepayment) {
+            usdtRepayment = minimumUsdtRepayment;
+        }
+        if (usdtRepayment > usdtBalanceForRepayment) {
+            usdtRepayment = usdtBalanceForRepayment;
+        }
+
         uint256 wethRepayment = getMinimumWethRepayment(
             uint256(reserveWeth),
             uint256(reserveUsdt),
-            amount1,
+            borrowedUsdt,
             usdtRepayment
         );
 
         if (usdtRepayment > 0) {
-            IERC20(USDT).transfer(address(wethUsdtPair), usdtRepayment);
+            IERC20(USDT).transfer(address(pair), usdtRepayment);
         }
         if (wethRepayment > 0) {
-            IERC20(WETH_ADDR).transfer(address(wethUsdtPair), wethRepayment);
+            IERC20(WETH_ADDR).transfer(address(pair), wethRepayment);
         }
+    }
+
+    receive() external payable {}
+
+    // required by the testing script, entry for your liquidation call
+    function operate() external {
+        // 1. get the target user account data & make sure it is liquidatable
+        (,,,,,uint256 healthFactor) = ILendingPool(AAVE_LENDING_POOL).getUserAccountData(TARGET_USER);
+        require(healthFactor < 1e18, "Target user is not liquidatable");
+
+        // 2. split the flash borrow across Sushi and Uniswap WETH/USDT pools
+        (uint112 uniReserveWeth, uint112 uniReserveUsdt,) = wethUsdtPair.getReserves();
+        (uint112 sushiReserveWeth, uint112 sushiReserveUsdt,) = sushiWethUsdtPair.getReserves();
+        require(uniReserveWeth > 0 && sushiReserveWeth > 0, "Missing flash liquidity");
+        uint256 uniBorrow = 0;
+        uint256 sushiBorrow = flashBorrowUsdt;
+
+        // token0=WETH, token1=USDT; borrow USDT so amount0Out=0, amount1Out=amount
+        sushiWethUsdtPair.swap(0, sushiBorrow, address(this), abi.encode(uniBorrow));
+
+        cleanupUsdcToWeth();
+        cleanupUsdtToWeth();
+
+        // 3. Convert the profit into ETH and send back to sender
+        uint256 wethBalance = IERC20(WETH_ADDR).balanceOf(address(this));
+        IWETH(WETH_ADDR).withdraw(wethBalance);
+        payable(msg.sender).transfer(address(this).balance);
+    }
+
+    // required by the swap
+    function uniswapV2Call(
+        address sender,
+        uint256,
+        uint256 amount1,
+        bytes calldata data
+    ) external override {
+        // 2.0. security checks
+        require(sender == address(this), "Invalid sender");
+        if (msg.sender == address(sushiWethUsdtPair)) {
+            uint256 uniBorrow = abi.decode(data, (uint256));
+            if (uniBorrow > 0) {
+                wethUsdtPair.swap(0, uniBorrow, address(this), bytes("inner"));
+            } else {
+                executeLiquidationAndSwaps(amount1);
+            }
+            repayFlashPair(sushiWethUsdtPair, amount1);
+            return;
+        }
+
+        if (msg.sender == address(wethUsdtPair)) {
+            executeLiquidationAndSwaps(IERC20(USDT).balanceOf(address(this)));
+            repayFlashPair(wethUsdtPair, amount1);
+            return;
+        }
+
+        revert("Unauthorized");
+    }
+}
+
+contract LiquidationOperator is BaseLiquidationOperator {
+    constructor() {
+        _setStrategy(10000, 1, 0, 6700, 10000);
+    }
+
+    function configureStrategy(
+        uint256 flashBorrowBps,
+        uint256 liquidationSteps,
+        uint256 directWbtcUsdtWeight,
+        uint256 usdtConversionTarget,
+        uint256 usdtRepayment
+    ) external {
+        _setStrategy(
+            flashBorrowBps,
+            liquidationSteps,
+            directWbtcUsdtWeight,
+            usdtConversionTarget,
+            usdtRepayment
+        );
     }
 }

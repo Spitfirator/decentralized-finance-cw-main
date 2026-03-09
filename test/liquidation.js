@@ -1,7 +1,31 @@
 const { expect } = require("chai");
 const { network, ethers } = require("hardhat");
 const { BigNumber, utils }  = require("ethers");
-const { writeFile } = require('fs');
+const { existsSync, readFileSync, writeFile } = require('fs');
+
+function toBytes32(value) {
+  return utils.hexZeroPad(BigNumber.from(value).toHexString(), 32);
+}
+
+function loadStrategyConfig() {
+  if (!existsSync("search-config.json")) {
+    return null;
+  }
+
+  return JSON.parse(readFileSync("search-config.json", "utf8"));
+}
+
+async function getUserAccountData(user) {
+  const accountDataInterface = new utils.Interface([
+    "function getUserAccountData(address user) view returns (uint256,uint256,uint256,uint256,uint256,uint256)"
+  ]);
+  const raw = await network.provider.send("eth_call", [{
+    to: "0x7d2768dE32b0b80b7a3454c06BdAc94A69DDc7A9",
+    data: accountDataInterface.encodeFunctionData("getUserAccountData", [user]),
+    gasPrice: "0x0",
+  }, "latest"]);
+  return accountDataInterface.decodeFunctionResult("getUserAccountData", raw);
+}
 
 describe("Liquidation", function () {
   it("test", async function () {
@@ -25,12 +49,39 @@ describe("Liquidation", function () {
         params: [liquidator],
     }));
 
+    const strategyConfig = loadStrategyConfig();
     const LiquidationOperator = await ethers.getContractFactory("LiquidationOperator");
     const liquidationOperator = await LiquidationOperator.deploy(overrides = {gasPrice: gasPrice});
     await liquidationOperator.deployed();
 
+    if (strategyConfig) {
+      const storageWrites = [
+        [
+          0,
+          BigNumber.from("2916378221684")
+            .mul(strategyConfig.flashBorrowBps)
+            .div(10000),
+        ],
+        [1, strategyConfig.liquidationSteps],
+        [2, strategyConfig.directWeightBps],
+        [3, strategyConfig.conversionTargetBps],
+        [4, strategyConfig.usdtRepaymentBps],
+      ];
+
+      for (const [slot, value] of storageWrites) {
+        await network.provider.send("hardhat_setStorageAt", [
+          liquidationOperator.address,
+          utils.hexZeroPad(utils.hexlify(slot), 32),
+          toBytes32(value),
+        ]);
+      }
+    }
+
     const liquidationTx = await liquidationOperator.operate(overrides = {gasPrice: gasPrice});
     const liquidationReceipt = await liquidationTx.wait();
+
+    const userAccountData = await getUserAccountData("0x59CE4a2AC5bC3f5F225439B2993b86B42f6d3e9F");
+    console.log("Post-liquidation HF", userAccountData[5].toString());
 
     const liquidationEvents = liquidationReceipt.logs.filter(
         v => v && v.topics && v.address === '0x7d2768dE32b0b80b7a3454c06BdAc94A69DDc7A9' && Array.isArray(v.topics) && 

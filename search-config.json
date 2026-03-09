@@ -1,0 +1,7 @@
+{
+  "flashBorrowBps": 10000,
+  "liquidationSteps": 1,
+  "directWeightBps": 0,
+  "conversionTargetBps": 6700,
+  "usdtRepaymentBps": 10000
+}
