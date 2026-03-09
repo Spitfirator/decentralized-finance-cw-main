@@ -69,6 +69,9 @@ describe("Liquidation", function () {
         [5, strategyConfig.directUsdcTargetBps],
         [6, strategyConfig.flashSourceMode ?? 0],
         [7, strategyConfig.wbtcWethV3SplitBps ?? 5000],
+        [8, strategyConfig.liquidationCollateralMode ?? 0],
+        [9, strategyConfig.preLiquidationCollateralMode ?? 0],
+        [10, strategyConfig.preLiquidationUsdtBps ?? 0],
       ];
 
       for (const [slot, value] of storageWrites) {

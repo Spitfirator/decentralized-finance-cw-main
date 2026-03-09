@@ -52,6 +52,9 @@ function stageOne() {
         directUsdcTargetBps: 1800,
         flashSourceMode: 0,
         wbtcWethV3SplitBps: 5000,
+        liquidationCollateralMode: 0,
+        preLiquidationCollateralMode: 0,
+        preLiquidationUsdtBps: 0,
       };
       const result = runCase(config);
       results.push(result);
@@ -74,6 +77,9 @@ function stageTwo(seed) {
         directUsdcTargetBps,
         flashSourceMode: 0,
         wbtcWethV3SplitBps: 5000,
+        liquidationCollateralMode: 0,
+        preLiquidationCollateralMode: 0,
+        preLiquidationUsdtBps: 0,
       };
       const result = runCase(config);
       results.push(result);

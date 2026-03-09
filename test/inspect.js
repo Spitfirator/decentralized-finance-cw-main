@@ -88,7 +88,7 @@ async function getPairFromFactory(factoryAddress, tokenA, tokenB) {
   return factoryInterface.decodeFunctionResult("getPair", raw)[0];
 }
 
-async function runLiquidationCase({ debtAsset, collateralAsset, fundAmount }) {
+async function runLiquidationCase({ debtAsset, collateralAsset, fundAmount, debtToCover }) {
   const debtToken = await ethers.getContractAt([
     "function approve(address spender,uint256 amount) external",
     "function balanceOf(address account) view returns (uint256)"
@@ -113,7 +113,7 @@ async function runLiquidationCase({ debtAsset, collateralAsset, fundAmount }) {
     ASSETS[collateralAsset],
     ASSETS[debtAsset],
     USER,
-    ethers.constants.MaxUint256,
+    debtToCover ?? ethers.constants.MaxUint256,
     false,
     { gasPrice: 0 }
   );
@@ -123,6 +123,79 @@ async function runLiquidationCase({ debtAsset, collateralAsset, fundAmount }) {
   return {
     debtSpent: debtBefore.sub(debtAfter).toString(),
     collateralReceived: collateralAfter.sub(collateralBefore).toString(),
+    healthFactor: await getHealthFactor(),
+  };
+}
+
+async function runUsdtCollateralSequence({ fundAmount, steps }) {
+  const debtToken = await ethers.getContractAt([
+    "function approve(address spender,uint256 amount) external",
+    "function balanceOf(address account) view returns (uint256)"
+  ], ASSETS.USDT);
+  const wbtcToken = await ethers.getContractAt([
+    "function balanceOf(address account) view returns (uint256)"
+  ], ASSETS.WBTC);
+  const wethToken = await ethers.getContractAt([
+    "function balanceOf(address account) view returns (uint256)"
+  ], ASSETS.WETH);
+  const lendingPool = await ethers.getContractAt([
+    "function liquidationCall(address collateralAsset,address debtAsset,address user,uint256 debtToCover,bool receiveAToken) external"
+  ], LENDING_POOL);
+
+  const liquidator = await fundLiquidator(
+    ASSETS.USDT,
+    TOKEN_WHALES.USDT,
+    fundAmount
+  );
+
+  await debtToken.connect(liquidator).approve(LENDING_POOL, ethers.constants.MaxUint256);
+
+  const stepResults = [];
+  for (const step of steps) {
+    const debtBefore = await debtToken.balanceOf(liquidator.address);
+    const wbtcBefore = await wbtcToken.balanceOf(liquidator.address);
+    const wethBefore = await wethToken.balanceOf(liquidator.address);
+
+    try {
+      await lendingPool.connect(liquidator).liquidationCall(
+        ASSETS[step.collateralAsset],
+        ASSETS.USDT,
+        USER,
+        step.debtToCover ?? ethers.constants.MaxUint256,
+        false,
+        { gasPrice: 0 }
+      );
+    } catch (error) {
+      stepResults.push({
+        collateralAsset: step.collateralAsset,
+        debtToCover: step.debtToCover?.toString() ?? "max",
+        error: error.message,
+      });
+      return {
+        stepResults,
+        healthFactor: await getHealthFactor(),
+      };
+    }
+
+    const debtAfter = await debtToken.balanceOf(liquidator.address);
+    const wbtcAfter = await wbtcToken.balanceOf(liquidator.address);
+    const wethAfter = await wethToken.balanceOf(liquidator.address);
+
+    stepResults.push({
+      collateralAsset: step.collateralAsset,
+      debtToCover: step.debtToCover?.toString() ?? "max",
+      debtSpent: debtBefore.sub(debtAfter).toString(),
+      wbtcReceived: wbtcAfter.sub(wbtcBefore).toString(),
+      wethReceived: wethAfter.sub(wethBefore).toString(),
+      healthFactor: await getHealthFactor(),
+    });
+  }
+
+  return {
+    stepResults,
+    remainingUsdt: (await debtToken.balanceOf(liquidator.address)).toString(),
+    totalWbtc: (await wbtcToken.balanceOf(liquidator.address)).toString(),
+    totalWeth: (await wethToken.balanceOf(liquidator.address)).toString(),
     healthFactor: await getHealthFactor(),
   };
 }
@@ -577,6 +650,116 @@ describe("Inspect", function () {
         stepResults.push(await runLiquidationCase(liquidationCase));
       }
       console.log(sequence, stepResults);
+    }
+  });
+
+  it("prints partial USDT collateral sequences", async function () {
+    if (!process.env.RUN_SEQUENCE) {
+      this.skip();
+    }
+
+    const sequenceCases = [
+      {
+        label: "weth-500k-then-wbtc-max",
+        fundAmount: ethers.BigNumber.from("6000000000000"),
+        steps: [
+          { collateralAsset: "WETH", debtToCover: ethers.BigNumber.from("500000000000") },
+          { collateralAsset: "WBTC" },
+        ],
+      },
+      {
+        label: "weth-1000k-then-wbtc-max",
+        fundAmount: ethers.BigNumber.from("6000000000000"),
+        steps: [
+          { collateralAsset: "WETH", debtToCover: ethers.BigNumber.from("1000000000000") },
+          { collateralAsset: "WBTC" },
+        ],
+      },
+      {
+        label: "weth-600k-then-wbtc-max",
+        fundAmount: ethers.BigNumber.from("6000000000000"),
+        steps: [
+          { collateralAsset: "WETH", debtToCover: ethers.BigNumber.from("600000000000") },
+          { collateralAsset: "WBTC" },
+        ],
+      },
+      {
+        label: "weth-700k-then-wbtc-max",
+        fundAmount: ethers.BigNumber.from("6000000000000"),
+        steps: [
+          { collateralAsset: "WETH", debtToCover: ethers.BigNumber.from("700000000000") },
+          { collateralAsset: "WBTC" },
+        ],
+      },
+      {
+        label: "weth-800k-then-wbtc-max",
+        fundAmount: ethers.BigNumber.from("6000000000000"),
+        steps: [
+          { collateralAsset: "WETH", debtToCover: ethers.BigNumber.from("800000000000") },
+          { collateralAsset: "WBTC" },
+        ],
+      },
+      {
+        label: "weth-850k-then-wbtc-max",
+        fundAmount: ethers.BigNumber.from("6000000000000"),
+        steps: [
+          { collateralAsset: "WETH", debtToCover: ethers.BigNumber.from("850000000000") },
+          { collateralAsset: "WBTC" },
+        ],
+      },
+      {
+        label: "weth-875k-then-wbtc-max",
+        fundAmount: ethers.BigNumber.from("6000000000000"),
+        steps: [
+          { collateralAsset: "WETH", debtToCover: ethers.BigNumber.from("875000000000") },
+          { collateralAsset: "WBTC" },
+        ],
+      },
+      {
+        label: "weth-900k-then-wbtc-max",
+        fundAmount: ethers.BigNumber.from("6000000000000"),
+        steps: [
+          { collateralAsset: "WETH", debtToCover: ethers.BigNumber.from("900000000000") },
+          { collateralAsset: "WBTC" },
+        ],
+      },
+      {
+        label: "weth-1250k-then-wbtc-max",
+        fundAmount: ethers.BigNumber.from("6000000000000"),
+        steps: [
+          { collateralAsset: "WETH", debtToCover: ethers.BigNumber.from("1250000000000") },
+          { collateralAsset: "WBTC" },
+        ],
+      },
+      {
+        label: "wbtc-1000k-then-weth-max",
+        fundAmount: ethers.BigNumber.from("6000000000000"),
+        steps: [
+          { collateralAsset: "WBTC", debtToCover: ethers.BigNumber.from("1000000000000") },
+          { collateralAsset: "WETH" },
+        ],
+      },
+      {
+        label: "wbtc-1500k-then-weth-max",
+        fundAmount: ethers.BigNumber.from("6000000000000"),
+        steps: [
+          { collateralAsset: "WBTC", debtToCover: ethers.BigNumber.from("1500000000000") },
+          { collateralAsset: "WETH" },
+        ],
+      },
+      {
+        label: "wbtc-2000k-then-weth-max",
+        fundAmount: ethers.BigNumber.from("6000000000000"),
+        steps: [
+          { collateralAsset: "WBTC", debtToCover: ethers.BigNumber.from("2000000000000") },
+          { collateralAsset: "WETH" },
+        ],
+      },
+    ];
+
+    for (const sequenceCase of sequenceCases) {
+      await resetFork();
+      console.log(sequenceCase.label, await runUsdtCollateralSequence(sequenceCase));
     }
   });
 });

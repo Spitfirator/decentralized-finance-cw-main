@@ -1,10 +1,13 @@
 {
-  "flashBorrowBps": 10000,
+  "flashBorrowBps": 12906,
   "liquidationSteps": 1,
-  "uniFlashBorrowBps": 0,
-  "conversionTargetBps": 6740,
+  "uniFlashBorrowBps": 1275,
+  "conversionTargetBps": 6900,
   "usdtRepaymentBps": 10000,
-  "directUsdcTargetBps": 1390,
+  "directUsdcTargetBps": 1260,
   "flashSourceMode": 0,
-  "wbtcWethV3SplitBps": 4950
+  "wbtcWethV3SplitBps": 4900,
+  "liquidationCollateralMode": 0,
+  "preLiquidationCollateralMode": 2,
+  "preLiquidationUsdtBps": 2906
 }

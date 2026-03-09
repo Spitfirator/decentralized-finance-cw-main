@@ -36,6 +36,9 @@ async function runCase(params) {
     params.directUsdcTargetBps,
     params.flashSourceMode,
     params.wbtcWethV3SplitBps,
+    params.liquidationCollateralMode,
+    params.preLiquidationCollateralMode,
+    params.preLiquidationUsdtBps,
     { gasPrice }
   );
   await operator.deployed();
@@ -75,6 +78,9 @@ describe("Search", function () {
           directUsdcTargetBps: 1800,
           flashSourceMode: 0,
           wbtcWethV3SplitBps: 5000,
+          liquidationCollateralMode: 0,
+          preLiquidationCollateralMode: 0,
+          preLiquidationUsdtBps: 0,
         });
         stageOne.push({
           flashBorrowBps,
@@ -85,6 +91,9 @@ describe("Search", function () {
           directUsdcTargetBps: 1800,
           flashSourceMode: 0,
           wbtcWethV3SplitBps: 5000,
+          liquidationCollateralMode: 0,
+          preLiquidationCollateralMode: 0,
+          preLiquidationUsdtBps: 0,
           profit,
         });
       }
@@ -113,6 +122,9 @@ describe("Search", function () {
             directUsdcTargetBps,
             flashSourceMode: 0,
             wbtcWethV3SplitBps: 5000,
+            liquidationCollateralMode: 0,
+            preLiquidationCollateralMode: 0,
+            preLiquidationUsdtBps: 0,
           });
           stageTwo.push({
             flashBorrowBps: bestStageOne.flashBorrowBps,
@@ -123,6 +135,9 @@ describe("Search", function () {
             directUsdcTargetBps,
             flashSourceMode: 0,
             wbtcWethV3SplitBps: 5000,
+            liquidationCollateralMode: 0,
+            preLiquidationCollateralMode: 0,
+            preLiquidationUsdtBps: 0,
             profit,
           });
         }
@@ -149,6 +164,9 @@ describe("Search", function () {
       directUsdcTargetBps: best.directUsdcTargetBps,
       flashSourceMode: best.flashSourceMode,
       wbtcWethV3SplitBps: best.wbtcWethV3SplitBps,
+      liquidationCollateralMode: best.liquidationCollateralMode,
+      preLiquidationCollateralMode: best.preLiquidationCollateralMode,
+      preLiquidationUsdtBps: best.preLiquidationUsdtBps,
     });
 
     if (profitEth(best.profit) < 126) {
