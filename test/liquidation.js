@@ -1,19 +1,7 @@
 const { expect } = require("chai");
 const { network, ethers } = require("hardhat");
 const { BigNumber, utils }  = require("ethers");
-const { existsSync, readFileSync, writeFile } = require('fs');
-
-function toBytes32(value) {
-  return utils.hexZeroPad(BigNumber.from(value).toHexString(), 32);
-}
-
-function loadStrategyConfig() {
-  if (!existsSync("search-config.json")) {
-    return null;
-  }
-
-  return JSON.parse(readFileSync("search-config.json", "utf8"));
-}
+const { writeFile } = require('fs');
 
 async function getUserAccountData(user) {
   const accountDataInterface = new utils.Interface([
@@ -49,39 +37,9 @@ describe("Liquidation", function () {
         params: [liquidator],
     }));
 
-    const strategyConfig = loadStrategyConfig();
     const LiquidationOperator = await ethers.getContractFactory("LiquidationOperator");
     const liquidationOperator = await LiquidationOperator.deploy(overrides = {gasPrice: gasPrice});
     await liquidationOperator.deployed();
-
-    if (strategyConfig) {
-      const storageWrites = [
-        [
-          0,
-          BigNumber.from("2916378221684")
-            .mul(strategyConfig.flashBorrowBps)
-            .div(10000),
-        ],
-        [1, strategyConfig.liquidationSteps],
-        [2, strategyConfig.uniFlashBorrowBps],
-        [3, strategyConfig.conversionTargetBps],
-        [4, strategyConfig.usdtRepaymentBps],
-        [5, strategyConfig.directUsdcTargetBps],
-        [6, strategyConfig.flashSourceMode ?? 0],
-        [7, strategyConfig.wbtcWethV3SplitBps ?? 5000],
-        [8, strategyConfig.liquidationCollateralMode ?? 0],
-        [9, strategyConfig.preLiquidationCollateralMode ?? 0],
-        [10, strategyConfig.preLiquidationUsdtBps ?? 0],
-      ];
-
-      for (const [slot, value] of storageWrites) {
-        await network.provider.send("hardhat_setStorageAt", [
-          liquidationOperator.address,
-          utils.hexZeroPad(utils.hexlify(slot), 32),
-          toBytes32(value),
-        ]);
-      }
-    }
 
     const liquidationTx = await liquidationOperator.operate(overrides = {gasPrice: gasPrice});
     const liquidationReceipt = await liquidationTx.wait();
