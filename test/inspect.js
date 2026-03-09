@@ -128,6 +128,144 @@ async function runLiquidationCase({ debtAsset, collateralAsset, fundAmount }) {
 }
 
 describe("Inspect", function () {
+  before(function () {
+    if (!process.env.RUN_INSPECT) {
+      this.skip();
+    }
+  });
+
+  it("probes curve registry variants", async function () {
+    await resetFork();
+
+    const providerGetAddressInterface = new ethers.utils.Interface([
+      "function get_address(uint256 id) view returns (address)"
+    ]);
+    const findPool2Interface = new ethers.utils.Interface([
+      "function find_pool_for_coins(address,address) view returns (address)"
+    ]);
+    const findPool3Interface = new ethers.utils.Interface([
+      "function find_pool_for_coins(address,address,uint256) view returns (address)"
+    ]);
+    const poolCountInterface = new ethers.utils.Interface([
+      "function pool_count() view returns (uint256)"
+    ]);
+    const poolListInterface = new ethers.utils.Interface([
+      "function pool_list(uint256) view returns (address)"
+    ]);
+    const getCoinsInterface = new ethers.utils.Interface([
+      "function get_coins(address) view returns (address[8])"
+    ]);
+    const poolCoinsInterface = new ethers.utils.Interface([
+      "function coins(uint256) view returns (address)"
+    ]);
+
+    async function providerEntry(id) {
+      const raw = await network.provider.send("eth_call", [{
+        to: CURVE_ADDRESS_PROVIDER,
+        data: providerGetAddressInterface.encodeFunctionData("get_address", [id]),
+        gasPrice: "0x0",
+      }, "latest"]);
+      return providerGetAddressInterface.decodeFunctionResult("get_address", raw)[0];
+    }
+
+    async function tryCall(address, iface, fn, args) {
+      if (address === ethers.constants.AddressZero) {
+        return "zero";
+      }
+
+      try {
+        const raw = await network.provider.send("eth_call", [{
+          to: address,
+          data: iface.encodeFunctionData(fn, args),
+          gasPrice: "0x0",
+        }, "latest"]);
+        const decoded = iface.decodeFunctionResult(fn, raw);
+        return decoded.length === 1 ? decoded[0] : decoded;
+      } catch (error) {
+        return "revert";
+      }
+    }
+
+    const entries = {};
+    for (let id = 0; id <= 10; id += 1) {
+      entries[id] = await providerEntry(id);
+    }
+    console.log("curveProbeEntries", entries);
+
+    for (const [id, address] of Object.entries(entries)) {
+      const poolCount = await tryCall(address, poolCountInterface, "pool_count", []);
+      const directFind = await tryCall(address, findPool2Interface, "find_pool_for_coins", [
+        ASSETS.WBTC,
+        ASSETS.USDT,
+      ]);
+      const indexedFind = await tryCall(address, findPool3Interface, "find_pool_for_coins", [
+        ASSETS.WBTC,
+        ASSETS.USDT,
+        0,
+      ]);
+
+      const summary = {
+        address,
+        poolCount: poolCount.toString ? poolCount.toString() : poolCount,
+        directFind,
+        indexedFind,
+      };
+
+      if (poolCount !== "revert" && poolCount !== "zero") {
+        const count = Number(poolCount.toString());
+        const pools = [];
+        for (let i = 0; i < count; i += 1) {
+          const pool = await tryCall(address, poolListInterface, "pool_list", [i]);
+          let coins = pool === "revert" || pool === "zero"
+            ? "unavailable"
+            : await tryCall(address, getCoinsInterface, "get_coins", [pool]);
+
+          if (coins === "revert" && pool !== "revert" && pool !== "zero") {
+            const discoveredCoins = [];
+            for (let coinIndex = 0; coinIndex < 8; coinIndex += 1) {
+              const coin = await tryCall(pool, poolCoinsInterface, "coins", [coinIndex]);
+              if (
+                typeof coin === "string" &&
+                coin !== ethers.constants.AddressZero &&
+                coin !== "revert" &&
+                coin !== "zero"
+              ) {
+                discoveredCoins.push(coin);
+              }
+            }
+            if (discoveredCoins.length > 0) {
+              coins = discoveredCoins;
+            }
+          }
+
+          const normalizedCoins = Array.isArray(coins)
+            ? coins.map((coin) => coin.toLowerCase())
+            : [];
+          const interesting =
+            normalizedCoins.includes(ASSETS.WBTC.toLowerCase()) ||
+            normalizedCoins.includes(ASSETS.WETH.toLowerCase()) ||
+            normalizedCoins.includes(ASSETS.USDT.toLowerCase()) ||
+            normalizedCoins.includes(ASSETS.USDC.toLowerCase());
+
+          if (!interesting && i >= 10) {
+            continue;
+          }
+
+          pools.push({
+            index: i,
+            pool,
+            coins: Array.isArray(coins)
+              ? coins.map((coin) => coin)
+              : coins,
+          });
+        }
+        summary.pools = pools;
+      }
+
+      console.log(`curveProbe-${id}`, summary);
+    }
+  });
+
   it("prints reserve state", async function () {
     await resetFork();
 

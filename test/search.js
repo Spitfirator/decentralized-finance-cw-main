@@ -30,9 +30,12 @@ async function runCase(params) {
   const operator = await Operator.deploy(
     params.flashBorrowBps,
     params.liquidationSteps,
-    params.directWeightBps,
+    params.uniFlashBorrowBps,
     params.conversionTargetBps,
     params.usdtRepaymentBps,
+    params.directUsdcTargetBps,
+    params.flashSourceMode,
+    params.wbtcWethV3SplitBps,
     { gasPrice }
   );
   await operator.deployed();
@@ -66,16 +69,22 @@ describe("Search", function () {
         const profit = await runCase({
           flashBorrowBps,
           liquidationSteps,
-          directWeightBps: 20000,
+          uniFlashBorrowBps: 0,
           conversionTargetBps: 7500,
           usdtRepaymentBps: 10000,
+          directUsdcTargetBps: 1800,
+          flashSourceMode: 0,
+          wbtcWethV3SplitBps: 5000,
         });
         stageOne.push({
           flashBorrowBps,
           liquidationSteps,
-          directWeightBps: 20000,
+          uniFlashBorrowBps: 0,
           conversionTargetBps: 7500,
           usdtRepaymentBps: 10000,
+          directUsdcTargetBps: 1800,
+          flashSourceMode: 0,
+          wbtcWethV3SplitBps: 5000,
           profit,
         });
       }
@@ -92,22 +101,28 @@ describe("Search", function () {
     }
 
     const stageTwo = [];
-    for (const directWeightBps of [0, 5000, 10000, 15000, 20000, 25000, 30000]) {
-      for (const conversionTargetBps of [0, 2500, 5000, 7500, 10000]) {
-        for (const usdtRepaymentBps of [0, 2500, 5000, 7500, 10000]) {
+    for (const uniFlashBorrowBps of [0, 1000, 2000, 3000, 4000, 5000]) {
+      for (const conversionTargetBps of [6000, 6500, 6700, 7000, 7500]) {
+        for (const directUsdcTargetBps of [1200, 1500, 1800, 2100, 2400]) {
           const profit = await runCase({
             flashBorrowBps: bestStageOne.flashBorrowBps,
             liquidationSteps: bestStageOne.liquidationSteps,
-            directWeightBps,
+            uniFlashBorrowBps,
             conversionTargetBps,
-            usdtRepaymentBps,
+            usdtRepaymentBps: 10000,
+            directUsdcTargetBps,
+            flashSourceMode: 0,
+            wbtcWethV3SplitBps: 5000,
           });
           stageTwo.push({
             flashBorrowBps: bestStageOne.flashBorrowBps,
             liquidationSteps: bestStageOne.liquidationSteps,
-            directWeightBps,
+            uniFlashBorrowBps,
             conversionTargetBps,
-            usdtRepaymentBps,
+            usdtRepaymentBps: 10000,
+            directUsdcTargetBps,
+            flashSourceMode: 0,
+            wbtcWethV3SplitBps: 5000,
             profit,
           });
         }
@@ -128,9 +143,12 @@ describe("Search", function () {
     console.log("Best params", {
       flashBorrowBps: best.flashBorrowBps,
       liquidationSteps: best.liquidationSteps,
-      directWeightBps: best.directWeightBps,
+      uniFlashBorrowBps: best.uniFlashBorrowBps,
       conversionTargetBps: best.conversionTargetBps,
       usdtRepaymentBps: best.usdtRepaymentBps,
+      directUsdcTargetBps: best.directUsdcTargetBps,
+      flashSourceMode: best.flashSourceMode,
+      wbtcWethV3SplitBps: best.wbtcWethV3SplitBps,
     });
 
     if (profitEth(best.profit) < 126) {

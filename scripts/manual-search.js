@@ -12,11 +12,10 @@ function writeConfig(config) {
 function runCase(config) {
   writeConfig(config);
 
-  const output = execFileSync("npm", ["test", "--silent"], {
+  const output = execFileSync("/bin/zsh", ["-lc", `ALCHE_API=${process.env.ALCHE_API} npm test`], {
     cwd,
     encoding: "utf8",
     env: {
-      ALCHE_API: process.env.ALCHE_API,
       PATH: process.env.PATH,
       HOME: process.env.HOME,
       SHELL: process.env.SHELL,
@@ -43,13 +42,16 @@ function sortResults(results) {
 function stageOne() {
   const results = [];
   for (const flashBorrowBps of [8000, 9000, 10000, 11000, 12000, 13000, 14000, 15000]) {
-    for (const directWeightBps of [0, 2000, 5000, 10000, 20000, 40000, 80000]) {
+    for (const uniFlashBorrowBps of [0, 1000, 2000, 3000, 4000, 5000]) {
       const config = {
         flashBorrowBps,
         liquidationSteps: 1,
-        directWeightBps,
+        uniFlashBorrowBps,
         conversionTargetBps: 7500,
         usdtRepaymentBps: 10000,
+        directUsdcTargetBps: 1800,
+        flashSourceMode: 0,
+        wbtcWethV3SplitBps: 5000,
       };
       const result = runCase(config);
       results.push(result);
@@ -61,14 +63,17 @@ function stageOne() {
 
 function stageTwo(seed) {
   const results = [];
-  for (const conversionTargetBps of [0, 2500, 5000, 7500, 10000]) {
-    for (const usdtRepaymentBps of [0, 2500, 5000, 7500, 10000]) {
+  for (const conversionTargetBps of [6000, 6500, 6700, 7000, 7500]) {
+    for (const directUsdcTargetBps of [1200, 1500, 1800, 2100, 2400]) {
       const config = {
         flashBorrowBps: seed.flashBorrowBps,
         liquidationSteps: 1,
-        directWeightBps: seed.directWeightBps,
+        uniFlashBorrowBps: seed.uniFlashBorrowBps,
         conversionTargetBps,
-        usdtRepaymentBps,
+        usdtRepaymentBps: 10000,
+        directUsdcTargetBps,
+        flashSourceMode: 0,
+        wbtcWethV3SplitBps: 5000,
       };
       const result = runCase(config);
       results.push(result);

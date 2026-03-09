@@ -63,9 +63,12 @@ describe("Liquidation", function () {
             .div(10000),
         ],
         [1, strategyConfig.liquidationSteps],
-        [2, strategyConfig.directWeightBps],
+        [2, strategyConfig.uniFlashBorrowBps],
         [3, strategyConfig.conversionTargetBps],
         [4, strategyConfig.usdtRepaymentBps],
+        [5, strategyConfig.directUsdcTargetBps],
+        [6, strategyConfig.flashSourceMode ?? 0],
+        [7, strategyConfig.wbtcWethV3SplitBps ?? 5000],
       ];
 
       for (const [slot, value] of storageWrites) {

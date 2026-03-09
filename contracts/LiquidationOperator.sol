@@ -47,6 +47,26 @@ interface ILendingPool {
             uint256 ltv,
             uint256 healthFactor
         );
+
+    function flashLoan(
+        address receiverAddress,
+        address[] calldata assets,
+        uint256[] calldata amounts,
+        uint256[] calldata modes,
+        address onBehalfOf,
+        bytes calldata params,
+        uint16 referralCode
+    ) external;
+}
+
+interface IFlashLoanReceiver {
+    function executeOperation(
+        address[] calldata assets,
+        uint256[] calldata amounts,
+        uint256[] calldata premiums,
+        address initiator,
+        bytes calldata params
+    ) external returns (bool);
 }
 
 // UniswapV2
@@ -135,6 +155,12 @@ interface ICurvePool {
         uint256 dx,
         uint256 minDy
     ) external;
+
+    function get_dy(
+        int128 i,
+        int128 j,
+        uint256 dx
+    ) external view returns (uint256);
 }
 
 interface ISwapRouter {
@@ -165,9 +191,75 @@ interface IQuoter {
     ) external returns (uint256 amountOut);
 }
 
+library DydxAccount {
+    struct Info {
+        address owner;
+        uint256 number;
+    }
+}
+
+library DydxTypes {
+    enum AssetDenomination {
+        Wei,
+        Par
+    }
+
+    enum AssetReference {
+        Delta,
+        Target
+    }
+
+    struct AssetAmount {
+        bool sign;
+        AssetDenomination denomination;
+        AssetReference ref;
+        uint256 value;
+    }
+}
+
+library DydxActions {
+    enum ActionType {
+        Deposit,
+        Withdraw,
+        Transfer,
+        Buy,
+        Sell,
+        Trade,
+        Liquidate,
+        Vaporize,
+        Call
+    }
+
+    struct ActionArgs {
+        ActionType actionType;
+        uint256 accountId;
+        DydxTypes.AssetAmount amount;
+        uint256 primaryMarketId;
+        uint256 secondaryMarketId;
+        address otherAddress;
+        uint256 otherAccountId;
+        bytes data;
+    }
+}
+
+interface ISoloMargin {
+    function operate(
+        DydxAccount.Info[] calldata accounts,
+        DydxActions.ActionArgs[] calldata actions
+    ) external;
+}
+
+interface ICallee {
+    function callFunction(
+        address sender,
+        DydxAccount.Info calldata accountInfo,
+        bytes calldata data
+    ) external;
+}
+
 // ----------------------IMPLEMENTATION------------------------------
 
-contract BaseLiquidationOperator is IUniswapV2Callee {
+contract BaseLiquidationOperator is IUniswapV2Callee, ICallee, IFlashLoanReceiver {
     uint8 public constant health_factor_decimals = 18;
 
     address constant USDT = 0xdAC17F958D2ee523a2206206994597C13D831ec7;
@@ -180,16 +272,22 @@ contract BaseLiquidationOperator is IUniswapV2Callee {
     address constant SUSHISWAP_FACTORY = 0xC0AEe478e3658e2610c5F7A4A2E1777cE9e4f2Ac;
     address constant UNISWAP_V3_ROUTER = 0xE592427A0AEce92De3Edee1F18E0157C05861564;
     address constant UNISWAP_V3_QUOTER = 0xb27308f9F90D607463bb33eA1BeBb41C27CE5AB6;
+    address constant DYDX_SOLO_MARGIN = 0x1E0447b19BB6EcFdAe1e4AE1694b0C3659614e4e;
     address constant TARGET_USER = 0x59CE4a2AC5bC3f5F225439B2993b86B42f6d3e9F;
     uint256 constant FIRST_LIQUIDATION_USDT = 2916378221684;
-    uint256 constant V3_DIRECT_USDC_TARGET_BPS = 1800;
     uint24 constant V3_FEE = 3000;
+    uint256 constant DYDX_USDC_MARKET_ID = 2;
+    uint256 constant DYDX_FLASH_FEE = 2;
+    uint256 constant CURVE_USDC_BUFFER = 10000000;
 
     uint256 flashBorrowUsdt;
     uint256 maxLiquidationSteps;
-    uint256 directWbtcUsdtWeightBps;
+    uint256 uniFlashBorrowBps;
     uint256 usdtConversionTargetBps;
     uint256 usdtRepaymentBps;
+    uint256 directUsdcTargetBps;
+    uint256 flashSourceMode;
+    uint256 wbtcWethV3SplitBps;
 
     IUniswapV2Pair immutable wethUsdtPair;
     IUniswapV2Pair immutable sushiWethUsdtPair;
@@ -440,15 +538,21 @@ contract BaseLiquidationOperator is IUniswapV2Callee {
     function _setStrategy(
         uint256 flashBorrowBps,
         uint256 liquidationSteps,
-        uint256 directWbtcUsdtWeight,
+        uint256 uniFlashBorrow,
         uint256 usdtConversionTarget,
-        uint256 usdtRepayment
+        uint256 usdtRepayment,
+        uint256 directUsdcTarget,
+        uint256 sourceMode,
+        uint256 wbtcWethV3Split
     ) internal {
         flashBorrowUsdt = (FIRST_LIQUIDATION_USDT * flashBorrowBps) / 10000;
         maxLiquidationSteps = liquidationSteps;
-        directWbtcUsdtWeightBps = directWbtcUsdtWeight;
+        uniFlashBorrowBps = uniFlashBorrow;
         usdtConversionTargetBps = usdtConversionTarget;
         usdtRepaymentBps = usdtRepayment;
+        directUsdcTargetBps = directUsdcTarget;
+        flashSourceMode = sourceMode;
+        wbtcWethV3SplitBps = wbtcWethV3Split;
     }
 
     function swapV3ExactInputSingle(
@@ -546,6 +650,83 @@ contract BaseLiquidationOperator is IUniswapV2Callee {
         return low;
     }
 
+    function quoteCurveUsdcToUsdt(uint256 amountIn)
+        internal
+        view
+        returns (uint256 amountOut)
+    {
+        if (amountIn == 0) {
+            return 0;
+        }
+
+        amountOut = ICurvePool(CURVE_3POOL).get_dy(1, 2, amountIn);
+    }
+
+    function findUsdcInForTargetUsdtCurve(uint256 targetUsdtOut)
+        internal
+        view
+        returns (uint256 usdcIn)
+    {
+        if (targetUsdtOut == 0) {
+            return 0;
+        }
+
+        uint256 low = 0;
+        uint256 high = targetUsdtOut;
+        while (quoteCurveUsdcToUsdt(high) < targetUsdtOut) {
+            high *= 2;
+        }
+
+        while (low < high) {
+            uint256 mid = (low + high) / 2;
+            if (quoteCurveUsdcToUsdt(mid) >= targetUsdtOut) {
+                high = mid;
+            } else {
+                low = mid + 1;
+            }
+        }
+
+        return low;
+    }
+
+    function swapWbtcToWethHybrid(uint256 totalWbtcIn) internal {
+        if (totalWbtcIn == 0) {
+            return;
+        }
+
+        uint256 v3WbtcIn = (totalWbtcIn * wbtcWethV3SplitBps) / 10000;
+        uint256 v2WbtcIn = totalWbtcIn - v3WbtcIn;
+
+        swapV3ExactInputSingle(WBTC, WETH_ADDR, v3WbtcIn);
+
+        if (v2WbtcIn == 0) {
+            return;
+        }
+
+        (uint112 uniReserveWbtc, uint112 uniReserveWeth,) = wbtcWethPair.getReserves();
+        (uint112 sushiReserveWbtc, uint112 sushiReserveWeth,) = sushiWbtcWethPair.getReserves();
+        uint256 totalReserveWbtc = uint256(uniReserveWbtc) + uint256(sushiReserveWbtc);
+        require(totalReserveWbtc > 0, "Missing WBTC/WETH liquidity");
+
+        uint256 uniWbtcIn = (v2WbtcIn * uint256(uniReserveWbtc)) / totalReserveWbtc;
+        uint256 sushiWbtcIn = v2WbtcIn - uniWbtcIn;
+
+        swapToken0ForToken1(
+            wbtcWethPair,
+            WBTC,
+            uniWbtcIn,
+            uint256(uniReserveWbtc),
+            uint256(uniReserveWeth)
+        );
+        swapToken0ForToken1(
+            sushiWbtcWethPair,
+            WBTC,
+            sushiWbtcIn,
+            uint256(sushiReserveWbtc),
+            uint256(sushiReserveWeth)
+        );
+    }
+
     function cleanupUsdcToWeth() internal {
         uint256 usdcBalance = IERC20(USDC).balanceOf(address(this));
         if (usdcBalance == 0) {
@@ -606,7 +787,10 @@ contract BaseLiquidationOperator is IUniswapV2Callee {
         );
     }
 
-    function executeLiquidationAndSwaps(uint256 totalBorrowedUsdt) internal {
+    function executeLiquidationAndSwaps(
+        uint256,
+        uint256 totalUsdtRepayment
+    ) internal {
         IERC20(USDT).approve(AAVE_LENDING_POOL, 0);
         IERC20(USDT).approve(AAVE_LENDING_POOL, type(uint256).max);
 
@@ -636,8 +820,12 @@ contract BaseLiquidationOperator is IUniswapV2Callee {
         // Split the liquidated WBTC across direct USDC and WETH routes on Uniswap V3.
         {
             uint256 wbtcBalance = IERC20(WBTC).balanceOf(address(this));
+            uint256 stableRepaymentTarget = totalUsdtRepayment;
+            if (flashSourceMode == 2) {
+                stableRepaymentTarget = findUsdcInForTargetUsdtCurve(totalUsdtRepayment);
+            }
             uint256 targetDirectUsdcOut =
-                ((totalBorrowedUsdt * V3_DIRECT_USDC_TARGET_BPS) / 10000);
+                ((stableRepaymentTarget * directUsdcTargetBps) / 10000);
             uint256 wbtcToUsdc = findWbtcInForTargetUsdcV3(
                 targetDirectUsdcOut,
                 wbtcBalance
@@ -645,7 +833,7 @@ contract BaseLiquidationOperator is IUniswapV2Callee {
             uint256 wbtcToWeth = wbtcBalance - wbtcToUsdc;
 
             swapV3ExactInputSingle(WBTC, USDC, wbtcToUsdc);
-            swapV3ExactInputSingle(WBTC, WETH_ADDR, wbtcToWeth);
+            swapWbtcToWethHybrid(wbtcToWeth);
 
             uint256 usdcBalance = IERC20(USDC).balanceOf(address(this));
             if (usdcBalance > 0) {
@@ -659,10 +847,15 @@ contract BaseLiquidationOperator is IUniswapV2Callee {
         {
             uint256 usdtBalance = IERC20(USDT).balanceOf(address(this));
             uint256 wethBalance = IERC20(WETH_ADDR).balanceOf(address(this));
-            if (usdtBalance < totalBorrowedUsdt && wethBalance > 0) {
-                uint256 usdtShortfall = totalBorrowedUsdt - usdtBalance;
-                uint256 targetUsdcOut =
-                    ((usdtShortfall * usdtConversionTargetBps) / 10000) + 1;
+            if (usdtBalance < totalUsdtRepayment && wethBalance > 0) {
+                uint256 usdtShortfall = totalUsdtRepayment - usdtBalance;
+                uint256 targetUsdcOut;
+                if (flashSourceMode == 2) {
+                    targetUsdcOut = findUsdcInForTargetUsdtCurve(usdtShortfall);
+                } else {
+                    targetUsdcOut =
+                        ((usdtShortfall * usdtConversionTargetBps) / 10000) + 1;
+                }
 
                 (uint112 uniReserveUsdc, uint112 uniReserveWeth,) = uniUsdcWethPair.getReserves();
                 (uint112 sushiReserveUsdc, uint112 sushiReserveWeth,) = sushiUsdcWethPair.getReserves();
@@ -706,6 +899,210 @@ contract BaseLiquidationOperator is IUniswapV2Callee {
                 }
             }
         }
+    }
+
+    function executeLiquidationAndSwapsForUsdcRepayment(
+        uint256,
+        uint256 totalUsdcRepayment
+    ) internal {
+        IERC20(USDT).approve(AAVE_LENDING_POOL, 0);
+        IERC20(USDT).approve(AAVE_LENDING_POOL, type(uint256).max);
+
+        ILendingPool lendingPool = ILendingPool(AAVE_LENDING_POOL);
+
+        for (uint256 i = 0; i < maxLiquidationSteps; i++) {
+            (,,,,,uint256 healthFactorCurrent) = lendingPool.getUserAccountData(TARGET_USER);
+            if (healthFactorCurrent >= 1e18) {
+                break;
+            }
+
+            uint256 usdtBalance = IERC20(USDT).balanceOf(address(this));
+            if (usdtBalance == 0) {
+                break;
+            }
+
+            uint256 usdtBefore = usdtBalance;
+            lendingPool.liquidationCall(WBTC, USDT, TARGET_USER, usdtBalance, false);
+            uint256 usdtAfter = IERC20(USDT).balanceOf(address(this));
+            if (usdtAfter >= usdtBefore) {
+                break;
+            }
+        }
+
+        {
+            uint256 wbtcBalance = IERC20(WBTC).balanceOf(address(this));
+            uint256 targetDirectUsdcOut =
+                ((totalUsdcRepayment * directUsdcTargetBps) / 10000);
+            uint256 wbtcToUsdc = findWbtcInForTargetUsdcV3(
+                targetDirectUsdcOut,
+                wbtcBalance
+            );
+            uint256 wbtcToWeth = wbtcBalance - wbtcToUsdc;
+
+            swapV3ExactInputSingle(WBTC, USDC, wbtcToUsdc);
+            swapWbtcToWethHybrid(wbtcToWeth);
+        }
+
+        {
+            uint256 usdcBalance = IERC20(USDC).balanceOf(address(this));
+            uint256 wethBalance = IERC20(WETH_ADDR).balanceOf(address(this));
+            if (usdcBalance < totalUsdcRepayment && wethBalance > 0) {
+                uint256 usdcShortfall = totalUsdcRepayment - usdcBalance;
+                uint256 targetUsdcOut =
+                    ((usdcShortfall * usdtConversionTargetBps) / 10000) + 1;
+
+                (uint112 uniReserveUsdc, uint112 uniReserveWeth,) = uniUsdcWethPair.getReserves();
+                (uint112 sushiReserveUsdc, uint112 sushiReserveWeth,) = sushiUsdcWethPair.getReserves();
+
+                uint256 wethToSell = findWethInForTargetUsdc(
+                    targetUsdcOut,
+                    wethBalance,
+                    uint256(uniReserveUsdc),
+                    uint256(uniReserveWeth),
+                    uint256(sushiReserveUsdc),
+                    uint256(sushiReserveWeth)
+                );
+
+                if (wethToSell > 0) {
+                    uint256 totalReserveWeth = uint256(uniReserveWeth) + uint256(sushiReserveWeth);
+                    require(totalReserveWeth > 0, "Missing USDC liquidity");
+                    uint256 uniWethIn = (wethToSell * uint256(uniReserveWeth)) / totalReserveWeth;
+                    uint256 sushiWethIn = wethToSell - uniWethIn;
+
+                    swapToken1ForToken0(
+                        uniUsdcWethPair,
+                        WETH_ADDR,
+                        uniWethIn,
+                        uint256(uniReserveWeth),
+                        uint256(uniReserveUsdc)
+                    );
+                    swapToken1ForToken0(
+                        sushiUsdcWethPair,
+                        WETH_ADDR,
+                        sushiWethIn,
+                        uint256(sushiReserveWeth),
+                        uint256(sushiReserveUsdc)
+                    );
+                }
+            }
+        }
+    }
+
+    function getDydxAccountInfo()
+        internal
+        view
+        returns (DydxAccount.Info memory)
+    {
+        return DydxAccount.Info({owner: address(this), number: 1});
+    }
+
+    function getDydxWithdrawAction(uint256 marketId, uint256 amount)
+        internal
+        view
+        returns (DydxActions.ActionArgs memory)
+    {
+        return
+            DydxActions.ActionArgs({
+                actionType: DydxActions.ActionType.Withdraw,
+                accountId: 0,
+                amount: DydxTypes.AssetAmount({
+                    sign: false,
+                    denomination: DydxTypes.AssetDenomination.Wei,
+                    ref: DydxTypes.AssetReference.Delta,
+                    value: amount
+                }),
+                primaryMarketId: marketId,
+                secondaryMarketId: 0,
+                otherAddress: address(this),
+                otherAccountId: 0,
+                data: bytes("")
+            });
+    }
+
+    function getDydxCallAction(bytes memory data)
+        internal
+        view
+        returns (DydxActions.ActionArgs memory)
+    {
+        return
+            DydxActions.ActionArgs({
+                actionType: DydxActions.ActionType.Call,
+                accountId: 0,
+                amount: DydxTypes.AssetAmount({
+                    sign: false,
+                    denomination: DydxTypes.AssetDenomination.Wei,
+                    ref: DydxTypes.AssetReference.Delta,
+                    value: 0
+                }),
+                primaryMarketId: 0,
+                secondaryMarketId: 0,
+                otherAddress: address(this),
+                otherAccountId: 0,
+                data: data
+            });
+    }
+
+    function getDydxDepositAction(uint256 marketId, uint256 amount)
+        internal
+        view
+        returns (DydxActions.ActionArgs memory)
+    {
+        return
+            DydxActions.ActionArgs({
+                actionType: DydxActions.ActionType.Deposit,
+                accountId: 0,
+                amount: DydxTypes.AssetAmount({
+                    sign: true,
+                    denomination: DydxTypes.AssetDenomination.Wei,
+                    ref: DydxTypes.AssetReference.Delta,
+                    value: amount
+                }),
+                primaryMarketId: marketId,
+                secondaryMarketId: 0,
+                otherAddress: address(this),
+                otherAccountId: 0,
+                data: bytes("")
+            });
+    }
+
+    function executeDydxUsdcFlashLoan(uint256 liquidationUsdt) internal {
+        uint256 borrowedUsdc =
+            findUsdcInForTargetUsdtCurve(liquidationUsdt) + CURVE_USDC_BUFFER;
+        uint256 repayUsdc = borrowedUsdc + DYDX_FLASH_FEE;
+
+        IERC20(USDC).approve(DYDX_SOLO_MARGIN, 0);
+        IERC20(USDC).approve(DYDX_SOLO_MARGIN, type(uint256).max);
+
+        DydxAccount.Info[] memory accounts = new DydxAccount.Info[](1);
+        accounts[0] = getDydxAccountInfo();
+
+        DydxActions.ActionArgs[] memory actions = new DydxActions.ActionArgs[](3);
+        actions[0] = getDydxWithdrawAction(DYDX_USDC_MARKET_ID, borrowedUsdc);
+        actions[1] = getDydxCallAction(abi.encode(borrowedUsdc, liquidationUsdt, repayUsdc));
+        actions[2] = getDydxDepositAction(DYDX_USDC_MARKET_ID, repayUsdc);
+
+        ISoloMargin(DYDX_SOLO_MARGIN).operate(accounts, actions);
+    }
+
+    function executeAaveUsdtFlashLoan(uint256 liquidationUsdt) internal {
+        address[] memory assets = new address[](1);
+        assets[0] = USDT;
+
+        uint256[] memory amounts = new uint256[](1);
+        amounts[0] = liquidationUsdt;
+
+        uint256[] memory modes = new uint256[](1);
+        modes[0] = 0;
+
+        ILendingPool(AAVE_LENDING_POOL).flashLoan(
+            address(this),
+            assets,
+            amounts,
+            modes,
+            address(this),
+            bytes(""),
+            0
+        );
     }
 
     function repayFlashPair(IUniswapV2Pair pair, uint256 borrowedUsdt) internal {
@@ -752,15 +1149,41 @@ contract BaseLiquidationOperator is IUniswapV2Callee {
         (,,,,,uint256 healthFactor) = ILendingPool(AAVE_LENDING_POOL).getUserAccountData(TARGET_USER);
         require(healthFactor < 1e18, "Target user is not liquidatable");
 
+        if (flashSourceMode == 1) {
+            executeDydxUsdcFlashLoan(flashBorrowUsdt);
+            cleanupUsdcToWeth();
+            cleanupUsdtToWeth();
+
+            uint256 wethBalanceDydx = IERC20(WETH_ADDR).balanceOf(address(this));
+            IWETH(WETH_ADDR).withdraw(wethBalanceDydx);
+            payable(msg.sender).transfer(address(this).balance);
+            return;
+        }
+
+        if (flashSourceMode == 2) {
+            executeAaveUsdtFlashLoan(flashBorrowUsdt);
+            cleanupUsdcToWeth();
+            cleanupUsdtToWeth();
+
+            uint256 wethBalanceAave = IERC20(WETH_ADDR).balanceOf(address(this));
+            IWETH(WETH_ADDR).withdraw(wethBalanceAave);
+            payable(msg.sender).transfer(address(this).balance);
+            return;
+        }
+
         // 2. split the flash borrow across Sushi and Uniswap WETH/USDT pools
-        (uint112 uniReserveWeth, uint112 uniReserveUsdt,) = wethUsdtPair.getReserves();
-        (uint112 sushiReserveWeth, uint112 sushiReserveUsdt,) = sushiWethUsdtPair.getReserves();
+        (uint112 uniReserveWeth,,) = wethUsdtPair.getReserves();
+        (uint112 sushiReserveWeth,,) = sushiWethUsdtPair.getReserves();
         require(uniReserveWeth > 0 && sushiReserveWeth > 0, "Missing flash liquidity");
-        uint256 uniBorrow = 0;
-        uint256 sushiBorrow = flashBorrowUsdt;
+        uint256 uniBorrow = (flashBorrowUsdt * uniFlashBorrowBps) / 10000;
+        uint256 sushiBorrow = flashBorrowUsdt - uniBorrow;
 
         // token0=WETH, token1=USDT; borrow USDT so amount0Out=0, amount1Out=amount
-        sushiWethUsdtPair.swap(0, sushiBorrow, address(this), abi.encode(uniBorrow));
+        if (sushiBorrow > 0) {
+            sushiWethUsdtPair.swap(0, sushiBorrow, address(this), abi.encode(uniBorrow));
+        } else {
+            wethUsdtPair.swap(0, uniBorrow, address(this), bytes("inner"));
+        }
 
         cleanupUsdcToWeth();
         cleanupUsdtToWeth();
@@ -785,40 +1208,92 @@ contract BaseLiquidationOperator is IUniswapV2Callee {
             if (uniBorrow > 0) {
                 wethUsdtPair.swap(0, uniBorrow, address(this), bytes("inner"));
             } else {
-                executeLiquidationAndSwaps(amount1);
+                executeLiquidationAndSwaps(amount1, amount1);
             }
             repayFlashPair(sushiWethUsdtPair, amount1);
             return;
         }
 
         if (msg.sender == address(wethUsdtPair)) {
-            executeLiquidationAndSwaps(IERC20(USDT).balanceOf(address(this)));
+            uint256 borrowedUsdt = IERC20(USDT).balanceOf(address(this));
+            executeLiquidationAndSwaps(borrowedUsdt, borrowedUsdt);
             repayFlashPair(wethUsdtPair, amount1);
             return;
         }
 
         revert("Unauthorized");
     }
+
+    function callFunction(
+        address sender,
+        DydxAccount.Info calldata,
+        bytes calldata data
+    ) external override {
+        require(msg.sender == DYDX_SOLO_MARGIN, "Unauthorized lender");
+        require(sender == address(this), "Invalid sender");
+
+        (uint256 borrowedUsdc, uint256 liquidationUsdt, uint256 repayUsdc) = abi
+            .decode(data, (uint256, uint256, uint256));
+
+        IERC20(USDC).approve(CURVE_3POOL, 0);
+        IERC20(USDC).approve(CURVE_3POOL, borrowedUsdc);
+        ICurvePool(CURVE_3POOL).exchange(1, 2, borrowedUsdc, 0);
+        require(
+            IERC20(USDT).balanceOf(address(this)) >= liquidationUsdt,
+            "Insufficient liquidation USDT"
+        );
+
+        executeLiquidationAndSwapsForUsdcRepayment(liquidationUsdt, repayUsdc);
+    }
+
+    function executeOperation(
+        address[] calldata assets,
+        uint256[] calldata amounts,
+        uint256[] calldata premiums,
+        address initiator,
+        bytes calldata
+    ) external override returns (bool) {
+        require(msg.sender == AAVE_LENDING_POOL, "Unauthorized lender");
+        require(initiator == address(this), "Invalid initiator");
+        require(assets.length == 1 && assets[0] == USDT, "Unexpected asset");
+
+        uint256 repayUsdt = amounts[0] + premiums[0];
+        executeLiquidationAndSwaps(amounts[0], repayUsdt);
+        require(
+            IERC20(USDT).balanceOf(address(this)) >= repayUsdt,
+            "Insufficient Aave repayment"
+        );
+
+        IERC20(USDT).approve(AAVE_LENDING_POOL, 0);
+        IERC20(USDT).approve(AAVE_LENDING_POOL, repayUsdt);
+        return true;
+    }
 }
 
 contract LiquidationOperator is BaseLiquidationOperator {
     constructor() {
-        _setStrategy(10000, 1, 0, 6700, 10000);
+        _setStrategy(10000, 1, 0, 6740, 10000, 1390, 0, 4950);
     }
 
     function configureStrategy(
         uint256 flashBorrowBps,
         uint256 liquidationSteps,
-        uint256 directWbtcUsdtWeight,
+        uint256 uniFlashBorrow,
         uint256 usdtConversionTarget,
-        uint256 usdtRepayment
+        uint256 usdtRepayment,
+        uint256 directUsdcTarget,
+        uint256 sourceMode,
+        uint256 wbtcWethV3Split
     ) external {
         _setStrategy(
             flashBorrowBps,
             liquidationSteps,
-            directWbtcUsdtWeight,
+            uniFlashBorrow,
             usdtConversionTarget,
-            usdtRepayment
+            usdtRepayment,
+            directUsdcTarget,
+            sourceMode,
+            wbtcWethV3Split
         );
     }
 }
