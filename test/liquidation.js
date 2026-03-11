@@ -3,18 +3,6 @@ const { network, ethers } = require("hardhat");
 const { BigNumber, utils }  = require("ethers");
 const { writeFile } = require('fs');
 
-async function getUserAccountData(user) {
-  const accountDataInterface = new utils.Interface([
-    "function getUserAccountData(address user) view returns (uint256,uint256,uint256,uint256,uint256,uint256)"
-  ]);
-  const raw = await network.provider.send("eth_call", [{
-    to: "0x7d2768dE32b0b80b7a3454c06BdAc94A69DDc7A9",
-    data: accountDataInterface.encodeFunctionData("getUserAccountData", [user]),
-    gasPrice: "0x0",
-  }, "latest"]);
-  return accountDataInterface.decodeFunctionResult("getUserAccountData", raw);
-}
-
 describe("Liquidation", function () {
   it("test", async function () {
     await network.provider.request({
@@ -44,9 +32,6 @@ describe("Liquidation", function () {
     const liquidationTx = await liquidationOperator.operate(overrides = {gasPrice: gasPrice});
     const liquidationReceipt = await liquidationTx.wait();
 
-    const userAccountData = await getUserAccountData("0x59CE4a2AC5bC3f5F225439B2993b86B42f6d3e9F");
-    console.log("Post-liquidation HF", userAccountData[5].toString());
-
     const liquidationEvents = liquidationReceipt.logs.filter(
         v => v && v.topics && v.address === '0x7d2768dE32b0b80b7a3454c06BdAc94A69DDc7A9' && Array.isArray(v.topics) && 
         v.topics.length > 3 && v.topics[0] === '0xe413a321e8681d831f4dbccbca790d2952b56f977908e45be37335533e005286')
@@ -65,6 +50,10 @@ describe("Liquidation", function () {
     console.log("Profit", utils.formatEther(profit), "ETH");
 
     expect(profit.gt(BigNumber.from(0)), "not profitable").to.be.true;
-    writeFile('profit.txt', String(utils.formatEther(profit)), function (err) {console.log("failed to write profit.txt: %s", err)});
+    writeFile('profit.txt', String(utils.formatEther(profit)), function (err) {
+      if (err) {
+        console.log("failed to write profit.txt: %s", err);
+      }
+    });
   });
 });
